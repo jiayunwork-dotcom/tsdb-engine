@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashSet, HashMap};
 use dashmap::DashMap;
+use crate::engine::SeriesInfo;
 
 pub struct InvertedIndex {
     index: DashMap<String, DashMap<String, HashSet<u64>>>,
@@ -62,7 +63,7 @@ impl InvertedIndex {
     pub fn get_tags_for_metric(
         &self,
         metric: &str,
-        series_registry: &dashmap::DashMap<u64, String>,
+        series_registry: &DashMap<u64, SeriesInfo>,
         _series_count: &dashmap::DashMap<String, usize>,
     ) -> Vec<(String, Vec<String>)> {
         let series_ids = self.lookup_metric(metric);
@@ -70,17 +71,11 @@ impl InvertedIndex {
 
         for sid in &series_ids {
             if let Some(entry) = series_registry.get(sid) {
-                let series_str = entry.value();
-                if let Some(tags_start) = series_str.find('{') {
-                    let tags_str = &series_str[tags_start + 1..series_str.len().saturating_sub(1)];
-                    for pair in tags_str.split(", ") {
-                        let kv: Vec<&str> = pair.splitn(2, '=').collect();
-                        if kv.len() == 2 {
-                            tag_keys.entry(kv[0].to_string())
-                                .or_insert_with(HashSet::new)
-                                .insert(kv[1].to_string());
-                        }
-                    }
+                let info = entry.value();
+                for (k, v) in &info.tags {
+                    tag_keys.entry(k.clone())
+                        .or_insert_with(HashSet::new)
+                        .insert(v.clone());
                 }
             }
         }

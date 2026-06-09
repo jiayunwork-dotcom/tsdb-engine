@@ -179,18 +179,9 @@ fn estimate_point_count(header: &[u8]) -> usize {
 }
 
 fn get_series_tags(engine: &TsdbEngine, series_id: u64) -> BTreeMap<String, String> {
-    let mut tags = BTreeMap::new();
     if let Some(entry) = engine.series_registry.get(&series_id) {
-        let series_str = entry.value().clone();
-        if let Some(tags_start) = series_str.find('{') {
-            let tags_str = &series_str[tags_start + 1..series_str.len().saturating_sub(1)];
-            for pair in tags_str.split(", ") {
-                let kv: Vec<&str> = pair.splitn(2, '=').collect();
-                if kv.len() == 2 {
-                    tags.insert(kv[0].to_string(), kv[1].to_string());
-                }
-            }
-        }
+        entry.value().tags.clone()
+    } else {
+        BTreeMap::new()
     }
-    tags
 }

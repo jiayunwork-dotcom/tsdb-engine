@@ -1,21 +1,16 @@
 use std::sync::Arc;
 use axum::{
     extract::State,
-    http::StatusCode,
+    http::{StatusCode, HeaderMap},
     response::IntoResponse,
     Json,
+    body::Bytes,
 };
 use serde::{Serialize, Deserialize};
 use crate::engine::TsdbEngine;
 use crate::model;
 use crate::engine::query::executor::{QueryRequest, execute_query};
 use crate::config::RetentionPolicy;
-
-#[derive(Deserialize)]
-pub struct WriteRequest {
-    #[serde(default)]
-    pub body: Option<String>,
-}
 
 #[derive(Serialize)]
 pub struct WriteResponse {
@@ -24,11 +19,49 @@ pub struct WriteResponse {
     pub errors: Vec<(usize, String)>,
 }
 
+fn decompress_body(headers: &HeaderMap, body: Bytes) -> Result<String, (StatusCode, String)> {
+    let encoding = headers
+        .get("content-encoding")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_lowercase();
+
+    match encoding.as_str() {
+        "gzip" => {
+            use std::io::Read;
+            let mut decoder = flate2::read::GzDecoder::new(&body[..]);
+            let mut decoded = String::new();
+            decoder.read_to_string(&mut decoded)
+                .map_err(|e| (StatusCode::BAD_REQUEST, format!("gzip decompression failed: {}", e)))?;
+            Ok(decoded)
+        }
+        "deflate" => {
+            use std::io::Read;
+            let mut decoder = flate2::read::DeflateDecoder::new(&body[..]);
+            let mut decoded = String::new();
+            decoder.read_to_string(&mut decoded)
+                .map_err(|e| (StatusCode::BAD_REQUEST, format!("deflate decompression failed: {}", e)))?;
+            Ok(decoded)
+        }
+        "" => {
+            String::from_utf8(body.to_vec())
+                .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid UTF-8 body: {}", e)))
+        }
+        other => Err((StatusCode::UNSUPPORTED_MEDIA_TYPE, format!("unsupported content-encoding: {}", other))),
+    }
+}
+
 pub async fn write_handler(
     State(engine): State<Arc<TsdbEngine>>,
-    body: String,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> impl IntoResponse {
-    let (points, parse_errors) = model::parse_batch(&body);
+    let text = match decompress_body(&headers, body) {
+        Ok(t) => t,
+        Err((status, msg)) => return (status, Json(serde_json::json!({"error": msg}))).into_response(),
+    };
+
+    let (points, parse_errors) = model::parse_batch(&text);
 
     if points.len() > 10000 {
         return (

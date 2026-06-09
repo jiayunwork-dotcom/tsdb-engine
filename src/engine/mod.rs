@@ -8,11 +8,17 @@ pub mod compaction;
 pub mod downsample;
 pub mod ttl;
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use parking_lot::{RwLock, Mutex};
 use dashmap::DashMap;
 use crate::config::EngineConfig;
+
+pub struct SeriesInfo {
+    pub metric: String,
+    pub tags: BTreeMap<String, String>,
+}
 
 pub struct TsdbEngine {
     pub config: EngineConfig,
@@ -22,7 +28,7 @@ pub struct TsdbEngine {
     pub inverted_index: Arc<index::InvertedIndex>,
     pub time_index: Arc<index::TimeIndex>,
     pub dict: Arc<index::GlobalDictionary>,
-    pub series_registry: Arc<DashMap<u64, String>>,
+    pub series_registry: Arc<DashMap<u64, SeriesInfo>>,
     pub series_count_per_metric: Arc<DashMap<String, usize>>,
     pub stats: Arc<Mutex<EngineStats>>,
 }
@@ -129,7 +135,12 @@ impl TsdbEngine {
             }
 
             if !already_exists {
-                self.series_registry.insert(series_id, format!("{}{:?}", point.metric, point.tags));
+                self.inverted_index.add_metric_series(&metric, series_id);
+
+                self.series_registry.insert(series_id, SeriesInfo {
+                    metric: point.metric.clone(),
+                    tags: point.tags.clone(),
+                });
                 *count.value_mut() += 1;
 
                 for (k, v) in &point.tags {
