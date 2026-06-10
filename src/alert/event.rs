@@ -147,7 +147,7 @@ impl EventStore {
                     }
                 }
                 if let Some(cursor_ts) = cursor {
-                    if e.timestamp >= cursor_ts {
+                    if e.timestamp > cursor_ts {
                         return false;
                     }
                 }
@@ -155,17 +155,29 @@ impl EventStore {
             });
         }
 
-        all_events.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        all_events.sort_by(|a, b| b.timestamp.cmp(&a.timestamp).then_with(|| b.id.cmp(&a.id)));
 
-        let next_cursor = if all_events.len() > limit {
-            all_events.get(limit).map(|e| e.timestamp)
+        if all_events.is_empty() {
+            return (Vec::new(), None);
+        }
+
+        if all_events.len() <= limit {
+            return (all_events, None);
+        }
+
+        let boundary_ts = all_events[limit - 1].timestamp;
+        let mut end_idx = limit;
+        while end_idx < all_events.len() && all_events[end_idx].timestamp == boundary_ts {
+            end_idx += 1;
+        }
+
+        let next_cursor = if end_idx < all_events.len() {
+            Some(all_events[end_idx].timestamp)
         } else {
             None
         };
 
-        let events: Vec<AlertEvent> = all_events.into_iter()
-            .take(limit)
-            .collect();
+        let events = all_events.into_iter().take(end_idx).collect();
 
         (events, next_cursor)
     }

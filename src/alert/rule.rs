@@ -44,15 +44,23 @@ pub struct AlertRule {
     pub conditions: Vec<SubCondition>,
     #[serde(default = "default_logic_operator")]
     pub logic: LogicOperator,
+    #[serde(default)]
     pub metric: String,
     #[serde(default)]
     pub tags: BTreeMap<String, String>,
+    #[serde(default = "default_agg_type")]
     pub aggregation: AggType,
+    #[serde(default = "default_window_secs")]
     pub window_secs: u64,
+    #[serde(default = "default_operator")]
     pub operator: CompareOp,
+    #[serde(default)]
     pub threshold: f64,
+    #[serde(default = "default_trigger_count")]
     pub trigger_count: u32,
+    #[serde(default = "default_severity")]
     pub severity: Severity,
+    #[serde(default = "default_silence_secs")]
     pub silence_secs: u64,
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -64,6 +72,30 @@ fn default_true() -> bool {
 
 fn default_logic_operator() -> LogicOperator {
     LogicOperator::And
+}
+
+fn default_agg_type() -> AggType {
+    AggType::Avg
+}
+
+fn default_window_secs() -> u64 {
+    300
+}
+
+fn default_operator() -> CompareOp {
+    CompareOp::Gt
+}
+
+fn default_trigger_count() -> u32 {
+    1
+}
+
+fn default_severity() -> Severity {
+    Severity::Warning
+}
+
+fn default_silence_secs() -> u64 {
+    300
 }
 
 impl AlertRule {

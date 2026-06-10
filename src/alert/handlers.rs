@@ -61,15 +61,21 @@ pub struct CreateRuleRequest {
     pub conditions: Vec<SubConditionRequest>,
     #[serde(default = "default_logic")]
     pub logic: String,
-    pub metric: String,
     #[serde(default)]
-    pub tags: BTreeMap<String, String>,
-    pub aggregation: String,
-    pub window_secs: u64,
-    pub operator: String,
-    pub threshold: f64,
+    pub metric: Option<String>,
+    #[serde(default)]
+    pub tags: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    pub aggregation: Option<String>,
+    #[serde(default)]
+    pub window_secs: Option<u64>,
+    #[serde(default)]
+    pub operator: Option<String>,
+    #[serde(default)]
+    pub threshold: Option<f64>,
     #[serde(default = "default_trigger_count")]
     pub trigger_count: u32,
+    #[serde(default = "default_severity")]
     pub severity: String,
     #[serde(default = "default_silence_secs")]
     pub silence_secs: u64,
@@ -81,6 +87,7 @@ fn default_trigger_count() -> u32 { 1 }
 fn default_silence_secs() -> u64 { 300 }
 fn default_true() -> bool { true }
 fn default_logic() -> String { "and".to_string() }
+fn default_severity() -> String { "warning".to_string() }
 
 #[derive(Serialize)]
 pub struct RuleWithState {
@@ -221,6 +228,13 @@ pub async fn create_rule_handler(
 ) -> impl IntoResponse {
     let alert_engine = &state.alert_engine;
 
+    if req.conditions.is_empty() && req.metric.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "must provide either conditions array or top-level metric field"})),
+        ).into_response();
+    }
+
     let conditions: Vec<SubCondition> = match req.conditions.iter().map(|c| c.to_sub_condition()).collect::<Result<Vec<_>, _>>() {
         Ok(cs) => {
             if cs.len() > 5 {
@@ -244,7 +258,29 @@ pub async fn create_rule_handler(
         }
     };
 
-    let aggregation = match AggType::from_str(&req.aggregation) {
+    let first_cond = conditions.first();
+
+    let metric = match req.metric {
+        Some(m) => m,
+        None => match first_cond {
+            Some(c) => c.metric.clone(),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "metric is required when no conditions provided"})),
+                ).into_response();
+            }
+        },
+    };
+
+    let tags = req.tags.unwrap_or_else(|| {
+        first_cond.map(|c| c.tags.clone()).unwrap_or_default()
+    });
+
+    let aggregation_str = req.aggregation.unwrap_or_else(|| {
+        first_cond.map(|c| c.aggregation.as_str().to_string()).unwrap_or_else(|| "avg".to_string())
+    });
+    let aggregation = match AggType::from_str(&aggregation_str) {
         Some(a) => a,
         None => {
             return (
@@ -254,7 +290,10 @@ pub async fn create_rule_handler(
         }
     };
 
-    let operator = match CompareOp::from_str(&req.operator) {
+    let operator_str = req.operator.unwrap_or_else(|| {
+        first_cond.map(|c| c.operator.as_str().to_string()).unwrap_or_else(|| ">".to_string())
+    });
+    let operator = match CompareOp::from_str(&operator_str) {
         Some(o) => o,
         None => {
             return (
@@ -263,6 +302,14 @@ pub async fn create_rule_handler(
             ).into_response();
         }
     };
+
+    let window_secs = req.window_secs.unwrap_or_else(|| {
+        first_cond.map(|c| c.window_secs).unwrap_or(300)
+    });
+
+    let threshold = req.threshold.unwrap_or_else(|| {
+        first_cond.map(|c| c.threshold).unwrap_or(0.0)
+    });
 
     let severity = match Severity::from_str(&req.severity) {
         Some(s) => s,
@@ -279,12 +326,12 @@ pub async fn create_rule_handler(
         name: req.name,
         conditions,
         logic,
-        metric: req.metric,
-        tags: req.tags,
+        metric,
+        tags,
         aggregation,
-        window_secs: req.window_secs,
+        window_secs,
         operator,
-        threshold: req.threshold,
+        threshold,
         trigger_count: req.trigger_count,
         severity,
         silence_secs: req.silence_secs,
