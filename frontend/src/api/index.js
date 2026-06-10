@@ -77,17 +77,48 @@ export async function createRetentionPolicy(policy) {
   return resp.data
 }
 
-export async function getAlerts() {
-  const resp = await api.get('/alerts')
+export async function getAlertRules() {
+  const resp = await api.get('/alerts/rules')
   return resp.data
 }
 
-export async function createAlert(alert) {
-  const resp = await api.post('/alerts', alert)
+export async function createAlertRule(rule) {
+  const resp = await api.post('/alerts/rules', rule)
   return resp.data
 }
 
-export async function getAlertHistory() {
-  const resp = await api.get('/alerts/history')
+export async function updateAlertRule(id, rule) {
+  const resp = await api.put(`/alerts/rules/${id}`, rule)
   return resp.data
+}
+
+export async function deleteAlertRule(id) {
+  const resp = await api.delete(`/alerts/rules/${id}`)
+  return resp.data
+}
+
+export async function enableAlertRule(id) {
+  const resp = await api.post(`/alerts/rules/${id}/enable`)
+  return resp.data
+}
+
+export async function disableAlertRule(id) {
+  const resp = await api.post(`/alerts/rules/${id}/disable`)
+  return resp.data
+}
+
+export async function getAlertEvents(params) {
+  const resp = await api.get('/alerts/events', { params: params || {} })
+  return resp.data
+}
+
+export async function getActiveAlerts() {
+  const resp = await api.get('/alerts/active')
+  return resp.data
+}
+
+export function createAlertWs() {
+  const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+  const url = `${proto}//${window.location.host}/ws/alerts`
+  return new WebSocket(url)
 }

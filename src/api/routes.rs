@@ -1,12 +1,19 @@
 use std::sync::Arc;
 use axum::{
-    routing::{get, post},
+    routing::{get, post, put, delete},
     Router,
 };
 use tower_http::cors::{CorsLayer, Any};
 use crate::engine::TsdbEngine;
+use crate::alert::engine::AlertEngine;
 
-pub fn create_router(engine: Arc<TsdbEngine>) -> Router {
+#[derive(Clone)]
+pub struct AppState {
+    pub engine: Arc<TsdbEngine>,
+    pub alert_engine: Arc<AlertEngine>,
+}
+
+pub fn create_router(state: AppState) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
@@ -27,9 +34,15 @@ pub fn create_router(engine: Arc<TsdbEngine>) -> Router {
         .route("/api/config/wal", post(super::handlers::wal_config_update_handler))
         .route("/api/config/retention", get(super::handlers::retention_list_handler))
         .route("/api/config/retention", post(super::handlers::retention_create_handler))
-        .route("/api/alerts", get(super::handlers::alerts_list_handler))
-        .route("/api/alerts", post(super::handlers::alerts_create_handler))
-        .route("/api/alerts/history", get(super::handlers::alerts_history_handler))
-        .with_state(engine)
+        .route("/api/alerts/rules", post(crate::alert::handlers::create_rule_handler))
+        .route("/api/alerts/rules", get(crate::alert::handlers::list_rules_handler))
+        .route("/api/alerts/rules/:id", put(crate::alert::handlers::update_rule_handler))
+        .route("/api/alerts/rules/:id", delete(crate::alert::handlers::delete_rule_handler))
+        .route("/api/alerts/rules/:id/enable", post(crate::alert::handlers::enable_rule_handler))
+        .route("/api/alerts/rules/:id/disable", post(crate::alert::handlers::disable_rule_handler))
+        .route("/api/alerts/events", get(crate::alert::handlers::list_events_handler))
+        .route("/api/alerts/active", get(crate::alert::handlers::active_alerts_handler))
+        .route("/ws/alerts", get(crate::alert::handlers::ws_alerts_handler))
+        .with_state(state)
         .layer(cors)
 }

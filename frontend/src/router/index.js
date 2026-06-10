@@ -6,6 +6,7 @@ const routes = [
   { path: '/query', name: 'Query', component: () => import('../views/QueryWorkbench.vue') },
   { path: '/admin', name: 'Admin', component: () => import('../views/Admin.vue') },
   { path: '/alerts', name: 'Alerts', component: () => import('../views/Alerts.vue') },
+  { path: '/alerts/events', name: 'AlertEvents', component: () => import('../views/AlertEvents.vue') },
 ]
 
 const router = createRouter({

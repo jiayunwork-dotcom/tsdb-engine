@@ -1,4 +1,3 @@
-use std::sync::Arc;
 use axum::{
     extract::State,
     http::{StatusCode, HeaderMap},
@@ -7,10 +6,10 @@ use axum::{
     body::Bytes,
 };
 use serde::{Serialize, Deserialize};
-use crate::engine::TsdbEngine;
 use crate::model;
 use crate::engine::query::executor::{QueryRequest, execute_query};
 use crate::config::RetentionPolicy;
+use super::routes::AppState;
 
 #[derive(Serialize)]
 pub struct WriteResponse {
@@ -66,10 +65,11 @@ fn decompress_body(headers: &HeaderMap, body: Bytes) -> Result<String, (StatusCo
 }
 
 pub async fn write_handler(
-    State(engine): State<Arc<TsdbEngine>>,
+    State(state): State<AppState>,
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
+    let engine = &state.engine;
     let text = match decompress_body(&headers, body) {
         Ok(t) => t,
         Err((status, msg)) => return (status, Json(serde_json::json!({"error": msg}))).into_response(),
@@ -99,18 +99,18 @@ pub async fn write_handler(
 }
 
 pub async fn delete_handler(
-    State(engine): State<Arc<TsdbEngine>>,
+    State(state): State<AppState>,
     Json(req): Json<DeleteRequest>,
 ) -> impl IntoResponse {
-    let deleted = engine.delete_points(&req.metric, &req.tags, req.start_time, req.end_time);
+    let deleted = state.engine.delete_points(&req.metric, &req.tags, req.start_time, req.end_time);
     Json(DeleteResponse { deleted }).into_response()
 }
 
 pub async fn query_handler(
-    State(engine): State<Arc<TsdbEngine>>,
+    State(state): State<AppState>,
     Json(req): Json<QueryRequest>,
 ) -> impl IntoResponse {
-    let result = execute_query(&engine, &req);
+    let result = execute_query(&state.engine, &req);
     Json(result).into_response()
 }
 
@@ -120,9 +120,9 @@ pub struct MetricsResponse {
 }
 
 pub async fn metrics_handler(
-    State(engine): State<Arc<TsdbEngine>>,
+    State(state): State<AppState>,
 ) -> impl IntoResponse {
-    let metrics = engine.list_metrics();
+    let metrics = state.engine.list_metrics();
     Json(MetricsResponse { metrics }).into_response()
 }
 
@@ -137,10 +137,10 @@ pub struct TagsResponse {
 }
 
 pub async fn tags_handler(
-    State(engine): State<Arc<TsdbEngine>>,
+    State(state): State<AppState>,
     axum::extract::Query(query): axum::extract::Query<TagsQuery>,
 ) -> impl IntoResponse {
-    let tags = engine.list_tags(&query.metric);
+    let tags = state.engine.list_tags(&query.metric);
     Json(TagsResponse { tags }).into_response()
 }
 
@@ -150,16 +150,16 @@ pub struct SeriesCountResponse {
 }
 
 pub async fn series_count_handler(
-    State(engine): State<Arc<TsdbEngine>>,
+    State(state): State<AppState>,
 ) -> impl IntoResponse {
-    let count = engine.series_count();
+    let count = state.engine.series_count();
     Json(SeriesCountResponse { count }).into_response()
 }
 
 pub async fn health_handler(
-    State(engine): State<Arc<TsdbEngine>>,
+    State(state): State<AppState>,
 ) -> impl IntoResponse {
-    let health = engine.health_check();
+    let health = state.engine.health_check();
     Json(health).into_response()
 }
 
@@ -175,10 +175,10 @@ pub struct BlocksQuery {
 }
 
 pub async fn blocks_handler(
-    State(engine): State<Arc<TsdbEngine>>,
+    State(state): State<AppState>,
     axum::extract::Query(query): axum::extract::Query<BlocksQuery>,
 ) -> impl IntoResponse {
-    let all_blocks = engine.time_index.all_blocks();
+    let all_blocks = state.engine.time_index.all_blocks();
     let blocks: Vec<_> = match (query.start_time, query.end_time) {
         (Some(start), Some(end)) => all_blocks.into_iter()
             .filter(|b| b.max_timestamp >= start && b.min_timestamp < end)
@@ -195,9 +195,9 @@ pub async fn blocks_handler(
 }
 
 pub async fn flush_handler(
-    State(engine): State<Arc<TsdbEngine>>,
+    State(state): State<AppState>,
 ) -> impl IntoResponse {
-    match engine.check_and_flush() {
+    match state.engine.check_and_flush() {
         Ok(()) => Json(serde_json::json!({"status": "ok"})).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -207,9 +207,9 @@ pub async fn flush_handler(
 }
 
 pub async fn compaction_handler(
-    State(engine): State<Arc<TsdbEngine>>,
+    State(state): State<AppState>,
 ) -> impl IntoResponse {
-    match crate::engine::compaction::run_compaction(&engine) {
+    match crate::engine::compaction::run_compaction(&state.engine) {
         Ok(()) => Json(serde_json::json!({"status": "ok"})).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -226,8 +226,9 @@ pub struct WalConfigResponse {
 }
 
 pub async fn wal_config_handler(
-    State(engine): State<Arc<TsdbEngine>>,
+    State(state): State<AppState>,
 ) -> impl IntoResponse {
+    let engine = &state.engine;
     let sync_mode = match engine.config.wal_sync_mode {
         crate::config::WalSyncMode::EveryWrite => "every_write",
         crate::config::WalSyncMode::EverySecond => "every_second",
@@ -246,16 +247,16 @@ pub struct WalConfigUpdate {
 }
 
 pub async fn wal_config_update_handler(
-    State(_engine): State<Arc<TsdbEngine>>,
+    State(_state): State<AppState>,
     Json(_req): Json<WalConfigUpdate>,
 ) -> impl IntoResponse {
     Json(serde_json::json!({"status": "ok", "message": "WAL sync mode updated (takes effect on new WAL segments)"})).into_response()
 }
 
 pub async fn retention_list_handler(
-    State(engine): State<Arc<TsdbEngine>>,
+    State(state): State<AppState>,
 ) -> impl IntoResponse {
-    let policies = &engine.config.retention_policies;
+    let policies = &state.engine.config.retention_policies;
     Json(policies).into_response()
 }
 
@@ -268,7 +269,7 @@ pub struct RetentionCreate {
 }
 
 pub async fn retention_create_handler(
-    State(_engine): State<Arc<TsdbEngine>>,
+    State(_state): State<AppState>,
     Json(req): Json<RetentionCreate>,
 ) -> impl IntoResponse {
     let policy = RetentionPolicy {
@@ -279,45 +280,4 @@ pub async fn retention_create_handler(
     };
 
     Json(serde_json::json!({"status": "ok", "policy": policy})).into_response()
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-pub struct AlertRule {
-    pub id: String,
-    pub metric: String,
-    pub tags: std::collections::BTreeMap<String, String>,
-    pub condition: String,
-    pub threshold: f64,
-    pub duration_secs: u64,
-    pub enabled: bool,
-}
-
-static ALERTS: parking_lot::Mutex<Vec<AlertRule>> = parking_lot::Mutex::new(Vec::new());
-static ALERT_HISTORY: parking_lot::Mutex<Vec<AlertEvent>> = parking_lot::Mutex::new(Vec::new());
-
-#[derive(Serialize, Deserialize, Clone)]
-pub struct AlertEvent {
-    pub alert_id: String,
-    pub metric: String,
-    pub value: f64,
-    pub threshold: f64,
-    pub timestamp: i64,
-}
-
-pub async fn alerts_list_handler() -> impl IntoResponse {
-    let alerts = ALERTS.lock();
-    Json(&*alerts).into_response()
-}
-
-pub async fn alerts_create_handler(
-    Json(req): Json<AlertRule>,
-) -> impl IntoResponse {
-    let mut alerts = ALERTS.lock();
-    alerts.push(req.clone());
-    Json(serde_json::json!({"status": "ok"})).into_response()
-}
-
-pub async fn alerts_history_handler() -> impl IntoResponse {
-    let history = ALERT_HISTORY.lock();
-    Json(&*history).into_response()
 }
