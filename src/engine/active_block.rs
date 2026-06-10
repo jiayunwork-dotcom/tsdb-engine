@@ -117,6 +117,25 @@ impl ActiveBlock {
         }
     }
 
+    pub fn delete_range(&mut self, metric: &str, tags_filter: &BTreeMap<String, String>, start: i64, end: i64) -> usize {
+        let mut deleted = 0usize;
+        for buffer in self.series_data.values_mut() {
+            if buffer.metric != metric {
+                continue;
+            }
+            if !tags_filter.is_empty() {
+                let matches = tags_filter.iter().all(|(k, v)| buffer.tags.get(k).map_or(false, |tv| tv == v));
+                if !matches {
+                    continue;
+                }
+            }
+            let before = buffer.points.len();
+            buffer.points.retain(|p| p.timestamp < start || p.timestamp >= end);
+            deleted += before - buffer.points.len();
+        }
+        deleted
+    }
+
     pub fn query_metric(&self, metric: &str, start: i64, end: i64) -> Vec<(u64, String, BTreeMap<String, String>, Vec<(i64, BTreeMap<String, FieldValue>)>)> {
         let mut results = Vec::new();
         for (&sid, buffer) in &self.series_data {

@@ -12,6 +12,8 @@ pub struct QueryRequest {
     pub field: Option<String>,
     pub aggregation: Option<String>,
     pub group_by: Option<String>,
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -19,6 +21,7 @@ pub struct QueryResult {
     pub metric: String,
     pub series: Vec<SeriesResult>,
     pub truncated: bool,
+    pub total: usize,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -52,6 +55,7 @@ pub fn execute_query(engine: &TsdbEngine, req: &QueryRequest) -> QueryResult {
 
     let mut results = Vec::new();
     let mut truncated = false;
+    let mut grand_total: usize = 0;
 
     for sid in &series_ids {
         let mut all_points: Vec<(i64, f64)> = Vec::new();
@@ -123,6 +127,19 @@ pub fn execute_query(engine: &TsdbEngine, req: &QueryRequest) -> QueryResult {
         if truncated { break; }
 
         all_points.sort_by_key(|(ts, _)| *ts);
+
+        grand_total += all_points.len();
+
+        let offset = req.offset.unwrap_or(0);
+        if offset > 0 {
+            all_points = all_points.into_iter().skip(offset).collect();
+        }
+        if let Some(limit) = req.limit {
+            if all_points.len() > limit {
+                all_points.truncate(limit);
+            }
+        }
+
         let tags = get_series_tags(engine, *sid);
 
         if let (Some(agg), Some(gb)) = (&agg_func, &group_by) {
@@ -151,6 +168,7 @@ pub fn execute_query(engine: &TsdbEngine, req: &QueryRequest) -> QueryResult {
         metric: req.metric.clone(),
         series: results,
         truncated,
+        total: grand_total,
     }
 }
 

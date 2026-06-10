@@ -99,6 +99,28 @@
           <button class="btn btn-sm btn-secondary" @click="loadBlocks">Refresh</button>
         </div>
       </div>
+      <div style="margin-bottom: 12px; padding: 12px; background: var(--bg); border-radius: 8px;">
+        <div class="flex gap-2 items-center flex-wrap">
+          <span style="font-size: 13px; color: var(--text-muted);">Time Range Filter:</span>
+          <div class="form-group" style="margin: 0; min-width: 180px;">
+            <input
+              type="datetime-local"
+              v-model="blockFilterStart"
+              style="font-size: 12px;"
+            />
+          </div>
+          <span style="color: var(--text-muted);">-</span>
+          <div class="form-group" style="margin: 0; min-width: 180px;">
+            <input
+              type="datetime-local"
+              v-model="blockFilterEnd"
+              style="font-size: 12px;"
+            />
+          </div>
+          <button class="btn btn-sm btn-primary" @click="loadBlocks">Apply</button>
+          <button class="btn btn-sm btn-secondary" @click="clearBlockFilter">Clear</button>
+        </div>
+      </div>
       <div v-if="blocks.length === 0" style="color: var(--text-muted); font-size: 13px; padding: 8px 0;">No blocks on disk</div>
       <div v-else style="overflow-x: auto;">
         <table>
@@ -143,6 +165,8 @@ const retentionPolicies = ref([])
 const newRetention = ref({ metric: '', ttl_days: 30, downsample_7d_interval_secs: null, downsample_30d_interval_secs: null })
 const walConfig = ref({ sync_mode: 'every_second', max_file_size_bytes: 67108864, current_size_bytes: 0 })
 const blocks = ref([])
+const blockFilterStart = ref('')
+const blockFilterEnd = ref('')
 
 function formatBytes(bytes) {
   if (bytes >= 1073741824) return (bytes / 1073741824).toFixed(1) + ' GB'
@@ -161,6 +185,13 @@ function formatInterval(secs) {
 function formatTimestamp(ns) {
   if (!ns) return '-'
   return new Date(ns / 1_000_000).toLocaleString()
+}
+
+function datetimeToNanos(dtStr) {
+  if (!dtStr) return null
+  const ms = new Date(dtStr).getTime()
+  if (isNaN(ms)) return null
+  return ms * 1_000_000
 }
 
 async function addRetention() {
@@ -182,9 +213,20 @@ async function updateWalConfig() {
   }
 }
 
+function clearBlockFilter() {
+  blockFilterStart.value = ''
+  blockFilterEnd.value = ''
+  loadBlocks()
+}
+
 async function loadBlocks() {
   try {
-    const resp = await getBlocks()
+    const params = {}
+    const startNs = datetimeToNanos(blockFilterStart.value)
+    const endNs = datetimeToNanos(blockFilterEnd.value)
+    if (startNs !== null) params.start_time = startNs
+    if (endNs !== null) params.end_time = endNs
+    const resp = await getBlocks(params)
     blocks.value = resp.blocks || []
   } catch (e) {
     console.error('Failed to load blocks:', e)

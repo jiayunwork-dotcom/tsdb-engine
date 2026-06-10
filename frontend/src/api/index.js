@@ -12,6 +12,11 @@ export async function writeData(text) {
   return resp.data
 }
 
+export async function deleteData(body) {
+  const resp = await api.post('/delete', body)
+  return resp.data
+}
+
 export async function queryData(query) {
   const resp = await api.post('/query', query)
   return resp.data
@@ -37,8 +42,8 @@ export async function getHealth() {
   return resp.data
 }
 
-export async function getBlocks() {
-  const resp = await api.get('/blocks')
+export async function getBlocks(params) {
+  const resp = await api.get('/blocks', { params: params || {} })
   return resp.data
 }
 

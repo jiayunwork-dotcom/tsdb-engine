@@ -42,6 +42,8 @@ pub struct EngineStats {
     pub memory_usage_bytes: u64,
     pub total_points_written: u64,
     pub total_queries: u64,
+    pub wal_recovered_records: u64,
+    pub wal_recovery_time_ms: u64,
 }
 
 impl TsdbEngine {
@@ -94,19 +96,28 @@ impl TsdbEngine {
     }
 
     fn recover_from_wal(&self) -> Result<(), String> {
+        let start = std::time::Instant::now();
         let entries = self.wal.recover()?;
         if entries.is_empty() {
             return Ok(());
         }
 
-        let entry_count = entries.len();
+        let entry_count = entries.len() as u64;
         let mut active = self.active_block.write();
         for entry in entries {
             let series_id = crate::model::compute_series_id(&entry.metric, &entry.tags);
             active.insert(series_id, entry.metric.clone(), entry.tags.clone(), entry.fields, entry.timestamp);
         }
 
-        tracing::info!("Recovered {} entries from WAL", entry_count);
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+
+        {
+            let mut stats = self.stats.lock();
+            stats.wal_recovered_records = entry_count;
+            stats.wal_recovery_time_ms = elapsed_ms;
+        }
+
+        tracing::info!("Recovered {} entries from WAL in {}ms", entry_count, elapsed_ms);
         Ok(())
     }
 
@@ -189,6 +200,16 @@ impl TsdbEngine {
         self.stats.lock().clone()
     }
 
+    pub fn delete_points(&self, metric: &str, tags: &std::collections::BTreeMap<String, String>, start_time: i64, end_time: i64) -> usize {
+        let exists = self.series_count_per_metric.contains_key(metric);
+        if !exists {
+            return 0;
+        }
+
+        let mut active = self.active_block.write();
+        active.delete_range(metric, tags, start_time, end_time)
+    }
+
     pub fn health_check(&self) -> serde_json::Value {
         let stats = self.stats.lock();
         serde_json::json!({
@@ -198,6 +219,8 @@ impl TsdbEngine {
             "memory_usage_bytes": stats.memory_usage_bytes,
             "write_qps": stats.write_qps,
             "query_latency_p99_us": stats.query_latency_p99_us,
+            "wal_recovered_records": stats.wal_recovered_records,
+            "wal_recovery_time_ms": stats.wal_recovery_time_ms,
         })
     }
 

@@ -14,6 +14,7 @@ pub fn create_router(engine: Arc<TsdbEngine>) -> Router {
 
     Router::new()
         .route("/api/write", post(super::handlers::write_handler))
+        .route("/api/delete", post(super::handlers::delete_handler))
         .route("/api/query", post(super::handlers::query_handler))
         .route("/api/metrics", get(super::handlers::metrics_handler))
         .route("/api/tags", get(super::handlers::tags_handler))

@@ -19,6 +19,20 @@ pub struct WriteResponse {
     pub errors: Vec<(usize, String)>,
 }
 
+#[derive(Deserialize)]
+pub struct DeleteRequest {
+    pub metric: String,
+    #[serde(default)]
+    pub tags: std::collections::BTreeMap<String, String>,
+    pub start_time: i64,
+    pub end_time: i64,
+}
+
+#[derive(Serialize)]
+pub struct DeleteResponse {
+    pub deleted: usize,
+}
+
 fn decompress_body(headers: &HeaderMap, body: Bytes) -> Result<String, (StatusCode, String)> {
     let encoding = headers
         .get("content-encoding")
@@ -84,6 +98,14 @@ pub async fn write_handler(
     }
 }
 
+pub async fn delete_handler(
+    State(engine): State<Arc<TsdbEngine>>,
+    Json(req): Json<DeleteRequest>,
+) -> impl IntoResponse {
+    let deleted = engine.delete_points(&req.metric, &req.tags, req.start_time, req.end_time);
+    Json(DeleteResponse { deleted }).into_response()
+}
+
 pub async fn query_handler(
     State(engine): State<Arc<TsdbEngine>>,
     Json(req): Json<QueryRequest>,
@@ -146,10 +168,29 @@ pub struct BlocksResponse {
     pub blocks: Vec<crate::engine::block::BlockMeta>,
 }
 
+#[derive(Deserialize, Default)]
+pub struct BlocksQuery {
+    pub start_time: Option<i64>,
+    pub end_time: Option<i64>,
+}
+
 pub async fn blocks_handler(
     State(engine): State<Arc<TsdbEngine>>,
+    axum::extract::Query(query): axum::extract::Query<BlocksQuery>,
 ) -> impl IntoResponse {
-    let blocks = engine.time_index.all_blocks();
+    let all_blocks = engine.time_index.all_blocks();
+    let blocks: Vec<_> = match (query.start_time, query.end_time) {
+        (Some(start), Some(end)) => all_blocks.into_iter()
+            .filter(|b| b.max_timestamp >= start && b.min_timestamp < end)
+            .collect(),
+        (Some(start), None) => all_blocks.into_iter()
+            .filter(|b| b.max_timestamp >= start)
+            .collect(),
+        (None, Some(end)) => all_blocks.into_iter()
+            .filter(|b| b.min_timestamp < end)
+            .collect(),
+        _ => all_blocks,
+    };
     Json(BlocksResponse { blocks }).into_response()
 }
 
