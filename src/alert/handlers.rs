@@ -8,12 +8,59 @@ use axum::{
 };
 use serde::{Serialize, Deserialize};
 use crate::alert::engine::AlertEngine;
-use crate::alert::rule::{AlertRule, AggType, CompareOp, Severity};
+use crate::alert::rule::{AlertRule, AggType, CompareOp, Severity, SubCondition, LogicOperator};
+use crate::alert::event::AlertEvent;
 use crate::api::routes::AppState;
+
+#[derive(Deserialize)]
+pub struct SubConditionRequest {
+    pub metric: String,
+    #[serde(default)]
+    pub tags: BTreeMap<String, String>,
+    pub aggregation: String,
+    pub window_secs: u64,
+    pub operator: String,
+    pub threshold: f64,
+}
+
+impl SubConditionRequest {
+    fn to_sub_condition(&self) -> Result<SubCondition, (StatusCode, Json<serde_json::Value>)> {
+        let aggregation = match AggType::from_str(&self.aggregation) {
+            Some(a) => a,
+            None => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "invalid aggregation in sub-condition, must be one of: avg, max, min, sum, count"})),
+                ));
+            }
+        };
+        let operator = match CompareOp::from_str(&self.operator) {
+            Some(o) => o,
+            None => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "invalid operator in sub-condition, must be one of: >, >=, <, <=, ==, !="})),
+                ));
+            }
+        };
+        Ok(SubCondition {
+            metric: self.metric.clone(),
+            tags: self.tags.clone(),
+            aggregation,
+            window_secs: self.window_secs,
+            operator,
+            threshold: self.threshold,
+        })
+    }
+}
 
 #[derive(Deserialize)]
 pub struct CreateRuleRequest {
     pub name: String,
+    #[serde(default)]
+    pub conditions: Vec<SubConditionRequest>,
+    #[serde(default = "default_logic")]
+    pub logic: String,
     pub metric: String,
     #[serde(default)]
     pub tags: BTreeMap<String, String>,
@@ -33,6 +80,7 @@ pub struct CreateRuleRequest {
 fn default_trigger_count() -> u32 { 1 }
 fn default_silence_secs() -> u64 { 300 }
 fn default_true() -> bool { true }
+fn default_logic() -> String { "and".to_string() }
 
 #[derive(Serialize)]
 pub struct RuleWithState {
@@ -48,6 +96,9 @@ pub struct RuleWithState {
 #[derive(Deserialize)]
 pub struct UpdateRuleRequest {
     pub name: Option<String>,
+    #[serde(default)]
+    pub conditions: Option<Vec<SubConditionRequest>>,
+    pub logic: Option<String>,
     pub metric: Option<String>,
     pub tags: Option<BTreeMap<String, String>>,
     pub aggregation: Option<String>,
@@ -66,19 +117,102 @@ pub struct EventsQuery {
     pub end_time: Option<i64>,
     pub severity: Option<String>,
     pub rule_name: Option<String>,
-    #[serde(default = "default_offset")]
-    pub offset: usize,
+    pub cursor: Option<i64>,
     #[serde(default = "default_limit")]
     pub limit: usize,
 }
 
-fn default_offset() -> usize { 0 }
 fn default_limit() -> usize { 50 }
 
 #[derive(Serialize)]
 pub struct EventsResponse {
-    pub events: Vec<crate::alert::event::AlertEvent>,
-    pub total: usize,
+    pub events: Vec<AlertEvent>,
+    pub next_cursor: Option<i64>,
+}
+
+#[derive(Deserialize)]
+pub struct AckRequest {
+    pub operator: String,
+}
+
+#[derive(Serialize)]
+pub struct AlertTemplate {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub conditions: Vec<TemplateSubCondition>,
+    pub logic: String,
+    pub severity: String,
+    pub trigger_count: u32,
+    pub silence_secs: u64,
+}
+
+#[derive(Serialize)]
+pub struct TemplateSubCondition {
+    pub metric: String,
+    pub aggregation: String,
+    pub window_secs: u64,
+    pub operator: String,
+    pub threshold: f64,
+}
+
+fn get_templates() -> Vec<AlertTemplate> {
+    vec![
+        AlertTemplate {
+            id: "cpu-high-load".to_string(),
+            name: "CPU High Load".to_string(),
+            description: "Alerts when CPU usage exceeds threshold over a time window".to_string(),
+            conditions: vec![
+                TemplateSubCondition {
+                    metric: "cpu_usage".to_string(),
+                    aggregation: "avg".to_string(),
+                    window_secs: 300,
+                    operator: ">".to_string(),
+                    threshold: 80.0,
+                },
+            ],
+            logic: "and".to_string(),
+            severity: "critical".to_string(),
+            trigger_count: 2,
+            silence_secs: 600,
+        },
+        AlertTemplate {
+            id: "memory-low".to_string(),
+            name: "Memory Insufficient".to_string(),
+            description: "Alerts when available memory drops below threshold".to_string(),
+            conditions: vec![
+                TemplateSubCondition {
+                    metric: "memory_available".to_string(),
+                    aggregation: "avg".to_string(),
+                    window_secs: 180,
+                    operator: "<".to_string(),
+                    threshold: 10.0,
+                },
+            ],
+            logic: "and".to_string(),
+            severity: "warning".to_string(),
+            trigger_count: 1,
+            silence_secs: 300,
+        },
+        AlertTemplate {
+            id: "disk-io-high".to_string(),
+            name: "Disk IO Too High".to_string(),
+            description: "Alerts when disk IO utilization exceeds threshold".to_string(),
+            conditions: vec![
+                TemplateSubCondition {
+                    metric: "disk_io_util".to_string(),
+                    aggregation: "max".to_string(),
+                    window_secs: 120,
+                    operator: ">".to_string(),
+                    threshold: 90.0,
+                },
+            ],
+            logic: "and".to_string(),
+            severity: "critical".to_string(),
+            trigger_count: 1,
+            silence_secs: 300,
+        },
+    ]
 }
 
 pub async fn create_rule_handler(
@@ -86,6 +220,30 @@ pub async fn create_rule_handler(
     Json(req): Json<CreateRuleRequest>,
 ) -> impl IntoResponse {
     let alert_engine = &state.alert_engine;
+
+    let conditions: Vec<SubCondition> = match req.conditions.iter().map(|c| c.to_sub_condition()).collect::<Result<Vec<_>, _>>() {
+        Ok(cs) => {
+            if cs.len() > 5 {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "maximum 5 sub-conditions allowed"})),
+                ).into_response();
+            }
+            cs
+        },
+        Err(e) => return e.into_response(),
+    };
+
+    let logic = match LogicOperator::from_str(&req.logic) {
+        Some(l) => l,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid logic, must be one of: and, or"})),
+            ).into_response();
+        }
+    };
+
     let aggregation = match AggType::from_str(&req.aggregation) {
         Some(a) => a,
         None => {
@@ -119,6 +277,8 @@ pub async fn create_rule_handler(
     let rule = AlertRule {
         id: uuid::Uuid::new_v4().to_string(),
         name: req.name,
+        conditions,
+        logic,
         metric: req.metric,
         tags: req.tags,
         aggregation,
@@ -174,6 +334,38 @@ pub async fn update_rule_handler(
         }
     };
 
+    let conditions = match req.conditions {
+        Some(cs) => {
+            let parsed: Vec<SubCondition> = match cs.iter().map(|c| c.to_sub_condition()).collect::<Result<Vec<_>, _>>() {
+                Ok(ps) => {
+                    if ps.len() > 5 {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({"error": "maximum 5 sub-conditions allowed"})),
+                        ).into_response();
+                    }
+                    ps
+                },
+                Err(e) => return e.into_response(),
+            };
+            parsed
+        },
+        None => existing.conditions,
+    };
+
+    let logic = match req.logic {
+        Some(ref l) => match LogicOperator::from_str(l) {
+            Some(op) => op,
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "invalid logic"})),
+                ).into_response();
+            }
+        },
+        None => existing.logic,
+    };
+
     let aggregation = match req.aggregation {
         Some(ref a) => match AggType::from_str(a) {
             Some(agg) => agg,
@@ -216,6 +408,8 @@ pub async fn update_rule_handler(
     let updated = AlertRule {
         id: existing.id,
         name: req.name.unwrap_or(existing.name),
+        conditions,
+        logic,
         metric: req.metric.unwrap_or(existing.metric),
         tags: req.tags.unwrap_or(existing.tags),
         aggregation,
@@ -293,15 +487,30 @@ pub async fn list_events_handler(
     Query(query): Query<EventsQuery>,
 ) -> impl IntoResponse {
     let alert_engine = &state.alert_engine;
-    let (events, total) = alert_engine.event_store().query(
+    let (events, next_cursor) = alert_engine.event_store().query(
         query.start_time,
         query.end_time,
         query.severity.as_deref(),
         query.rule_name.as_deref(),
-        query.offset,
+        query.cursor,
         query.limit,
     );
-    Json(EventsResponse { events, total }).into_response()
+    Json(EventsResponse { events, next_cursor }).into_response()
+}
+
+pub async fn acknowledge_event_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<AckRequest>,
+) -> impl IntoResponse {
+    let alert_engine = &state.alert_engine;
+    match alert_engine.acknowledge_event(&id, &req.operator) {
+        Some(event) => Json(serde_json::json!({"status": "ok", "event": event})).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "event not found or already acknowledged"})),
+        ).into_response(),
+    }
 }
 
 pub async fn active_alerts_handler(
@@ -309,6 +518,10 @@ pub async fn active_alerts_handler(
 ) -> impl IntoResponse {
     let active = state.alert_engine.event_store().active_firing();
     Json(active).into_response()
+}
+
+pub async fn list_templates_handler() -> impl IntoResponse {
+    Json(get_templates()).into_response()
 }
 
 pub async fn ws_alerts_handler(

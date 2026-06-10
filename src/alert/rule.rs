@@ -2,9 +2,48 @@ use std::collections::BTreeMap;
 use serde::{Serialize, Deserialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubCondition {
+    pub metric: String,
+    #[serde(default)]
+    pub tags: BTreeMap<String, String>,
+    pub aggregation: AggType,
+    pub window_secs: u64,
+    pub operator: CompareOp,
+    pub threshold: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogicOperator {
+    And,
+    Or,
+}
+
+impl LogicOperator {
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "and" => Some(LogicOperator::And),
+            "or" => Some(LogicOperator::Or),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        match self {
+            LogicOperator::And => "and",
+            LogicOperator::Or => "or",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AlertRule {
     pub id: String,
     pub name: String,
+    #[serde(default)]
+    pub conditions: Vec<SubCondition>,
+    #[serde(default = "default_logic_operator")]
+    pub logic: LogicOperator,
     pub metric: String,
     #[serde(default)]
     pub tags: BTreeMap<String, String>,
@@ -21,6 +60,37 @@ pub struct AlertRule {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_logic_operator() -> LogicOperator {
+    LogicOperator::And
+}
+
+impl AlertRule {
+    pub fn effective_conditions(&self) -> Vec<SubCondition> {
+        if !self.conditions.is_empty() {
+            self.conditions.clone()
+        } else {
+            vec![SubCondition {
+                metric: self.metric.clone(),
+                tags: self.tags.clone(),
+                aggregation: self.aggregation,
+                window_secs: self.window_secs,
+                operator: self.operator,
+                threshold: self.threshold,
+            }]
+        }
+    }
+
+    pub fn evaluate_logic(&self, results: &[bool]) -> bool {
+        if results.is_empty() {
+            return false;
+        }
+        match self.logic {
+            LogicOperator::And => results.iter().all(|&r| r),
+            LogicOperator::Or => results.iter().any(|&r| r),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -136,6 +206,7 @@ pub enum RuleState {
     Inactive,
     Pending,
     Firing,
+    Acknowledged,
     Resolved,
 }
 
@@ -145,6 +216,7 @@ impl RuleState {
             RuleState::Inactive => "inactive",
             RuleState::Pending => "pending",
             RuleState::Firing => "firing",
+            RuleState::Acknowledged => "acknowledged",
             RuleState::Resolved => "resolved",
         }
     }

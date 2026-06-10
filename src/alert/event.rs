@@ -14,6 +14,10 @@ pub struct AlertEvent {
     pub metric: String,
     #[serde(default)]
     pub tags: BTreeMap<String, String>,
+    #[serde(default)]
+    pub acknowledged: bool,
+    #[serde(default)]
+    pub acknowledged_by: Option<String>,
 }
 
 pub struct EventStore {
@@ -66,9 +70,9 @@ impl EventStore {
         end_time: Option<i64>,
         severity: Option<&str>,
         rule_name: Option<&str>,
-        offset: usize,
+        cursor: Option<i64>,
         limit: usize,
-    ) -> (Vec<AlertEvent>, usize) {
+    ) -> (Vec<AlertEvent>, Option<i64>) {
         let mut all_events = Vec::new();
 
         if let Ok(entries) = std::fs::read_dir(&self.dir) {
@@ -79,7 +83,13 @@ impl EventStore {
                     continue;
                 }
 
-                if let Some(start) = start_time {
+                let effective_start = if let Some(cursor_ts) = cursor {
+                    Some(std::cmp::max(start_time.unwrap_or(i64::MIN), cursor_ts))
+                } else {
+                    start_time
+                };
+
+                if let Some(start) = effective_start {
                     let day_start_nanos = self.day_start_nanos_from_filename(filename);
                     if let Some(ds) = day_start_nanos {
                         let day_end_nanos = ds + 86400_000_000_000i64;
@@ -124,7 +134,7 @@ impl EventStore {
             });
         }
 
-        if start_time.is_some() || end_time.is_some() {
+        if start_time.is_some() || end_time.is_some() || cursor.is_some() {
             all_events.retain(|e| {
                 if let Some(start) = start_time {
                     if e.timestamp < start {
@@ -136,19 +146,28 @@ impl EventStore {
                         return false;
                     }
                 }
+                if let Some(cursor_ts) = cursor {
+                    if e.timestamp >= cursor_ts {
+                        return false;
+                    }
+                }
                 true
             });
         }
 
         all_events.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
 
-        let total = all_events.len();
+        let next_cursor = if all_events.len() > limit {
+            all_events.get(limit).map(|e| e.timestamp)
+        } else {
+            None
+        };
+
         let events: Vec<AlertEvent> = all_events.into_iter()
-            .skip(offset)
             .take(limit)
             .collect();
 
-        (events, total)
+        (events, next_cursor)
     }
 
     fn day_start_nanos_from_filename(&self, filename: &str) -> Option<i64> {
@@ -209,5 +228,41 @@ impl EventStore {
         }
 
         firing_events.into_values().collect()
+    }
+
+    pub fn acknowledge_event(&self, event_id: &str, operator: &str) -> Option<AlertEvent> {
+        if let Ok(entries) = std::fs::read_dir(&self.dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if !filename.starts_with("events-") || !filename.ends_with(".jsonl") {
+                    continue;
+                }
+
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+                    let mut found_event: Option<AlertEvent> = None;
+
+                    for line in lines.iter_mut() {
+                        if let Ok(mut event) = serde_json::from_str::<AlertEvent>(line) {
+                            if event.id == event_id && event.event_type == "firing" && !event.acknowledged {
+                                event.acknowledged = true;
+                                event.acknowledged_by = Some(operator.to_string());
+                                found_event = Some(event.clone());
+                                *line = serde_json::to_string(&event).unwrap_or(line.clone());
+                                break;
+                            }
+                        }
+                    }
+
+                    if found_event.is_some() {
+                        let new_content = lines.join("\n");
+                        let _ = std::fs::write(&path, new_content);
+                        return found_event;
+                    }
+                }
+            }
+        }
+        None
     }
 }

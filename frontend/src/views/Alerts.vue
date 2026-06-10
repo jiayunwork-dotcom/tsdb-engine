@@ -6,7 +6,7 @@
           <h1>Alert Rules</h1>
           <p>Manage alerting rules based on time-series data conditions</p>
         </div>
-        <button class="btn btn-primary" @click="showCreateModal = true">+ New Rule</button>
+        <button class="btn btn-primary" @click="openCreateModal">+ New Rule</button>
       </div>
     </div>
 
@@ -23,6 +23,7 @@
             <th>Condition</th>
             <th>Severity</th>
             <th>State</th>
+            <th>Current Value</th>
             <th>Enabled</th>
             <th>Actions</th>
           </tr>
@@ -32,7 +33,14 @@
             <td style="font-weight:600;color:var(--text-h)">{{ r.name }}</td>
             <td><span style="font-family:var(--mono);font-size:12px">{{ r.metric }}</span></td>
             <td>
-              <span style="font-family:var(--mono);font-size:12px">
+              <template v-if="r.conditions && r.conditions.length > 0">
+                <div v-for="(c, i) in r.conditions" :key="i" style="font-family:var(--mono);font-size:12px">
+                  <span v-if="i > 0" class="logic-tag">{{ r.logic }}</span>
+                  {{ c.aggregation }}({{ formatWindow(c.window_secs) }}) {{ c.operator }} {{ c.threshold }}
+                  <span style="color:var(--text-muted);margin-left:2px">[{{ c.metric }}]</span>
+                </div>
+              </template>
+              <span v-else style="font-family:var(--mono);font-size:12px">
                 {{ r.aggregation }}({{ formatWindow(r.window_secs) }}) {{ r.operator }} {{ r.threshold }}
               </span>
             </td>
@@ -41,6 +49,12 @@
             </td>
             <td>
               <span class="badge" :class="stateClass(r.state)">{{ r.state }}</span>
+            </td>
+            <td>
+              <span v-if="r.current_value != null" class="value-cell" :class="r.state === 'firing' ? 'value-alert' : 'value-ok'">
+                {{ r.current_value.toFixed(4) }}
+              </span>
+              <span v-else style="color:var(--text-muted);font-size:12px">—</span>
             </td>
             <td>
               <label class="toggle-switch">
@@ -60,53 +74,24 @@
     </div>
 
     <div v-if="showCreateModal || showEditModal" class="modal-overlay" @click.self="closeModal">
-      <div class="modal">
+      <div class="modal modal-wide">
         <div class="modal-header">
           <h3>{{ showEditModal ? 'Edit Rule' : 'New Alert Rule' }}</h3>
           <button class="modal-close" @click="closeModal">&times;</button>
         </div>
         <div class="modal-body">
+          <div v-if="showCreateModal" class="form-group" style="margin-bottom:16px">
+            <label>Template</label>
+            <select v-model="selectedTemplate" @change="applyTemplate">
+              <option value="">— Manual —</option>
+              <option v-for="t in templates" :key="t.id" :value="t.id">{{ t.name }}</option>
+            </select>
+          </div>
+
           <div class="form-grid">
             <div class="form-group">
               <label>Rule Name</label>
               <input v-model="form.name" placeholder="e.g., High CPU Alert" />
-            </div>
-            <div class="form-group">
-              <label>Metric</label>
-              <input v-model="form.metric" placeholder="e.g., cpu" />
-            </div>
-            <div class="form-group">
-              <label>Aggregation</label>
-              <select v-model="form.aggregation">
-                <option value="avg">avg</option>
-                <option value="max">max</option>
-                <option value="min">min</option>
-                <option value="sum">sum</option>
-                <option value="count">count</option>
-              </select>
-            </div>
-            <div class="form-group">
-              <label>Window (seconds)</label>
-              <input v-model.number="form.window_secs" type="number" min="15" />
-            </div>
-            <div class="form-group">
-              <label>Operator</label>
-              <select v-model="form.operator">
-                <option value=">">&gt; Greater Than</option>
-                <option value=">=">&ge; Greater or Equal</option>
-                <option value="<">&lt; Less Than</option>
-                <option value="<=">&le; Less or Equal</option>
-                <option value="==">== Equal</option>
-                <option value="!=">!= Not Equal</option>
-              </select>
-            </div>
-            <div class="form-group">
-              <label>Threshold</label>
-              <input v-model.number="form.threshold" type="number" step="0.1" />
-            </div>
-            <div class="form-group">
-              <label>Trigger Count</label>
-              <input v-model.number="form.trigger_count" type="number" min="1" />
             </div>
             <div class="form-group">
               <label>Severity</label>
@@ -117,12 +102,71 @@
               </select>
             </div>
             <div class="form-group">
+              <label>Logic Operator</label>
+              <select v-model="form.logic">
+                <option value="and">AND (all conditions must match)</option>
+                <option value="or">OR (any condition matches)</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label>Trigger Count</label>
+              <input v-model.number="form.trigger_count" type="number" min="1" />
+            </div>
+            <div class="form-group">
               <label>Silence (seconds)</label>
               <input v-model.number="form.silence_secs" type="number" min="0" />
             </div>
-            <div class="form-group">
-              <label>Tags Filter (key=value, comma separated)</label>
-              <input v-model="form.tagsStr" placeholder="e.g., host=server01,region=us-west" />
+          </div>
+
+          <div style="margin-top:16px">
+            <div class="flex items-center justify-between" style="margin-bottom:8px">
+              <label style="font-weight:600;color:var(--text-h)">Sub-Conditions ({{ form.conditions.length }}/5)</label>
+              <button class="btn btn-secondary btn-sm" @click="addCondition" :disabled="form.conditions.length >= 5">+ Add Condition</button>
+            </div>
+            <div v-for="(cond, idx) in form.conditions" :key="idx" class="condition-card">
+              <div class="condition-header">
+                <span>Condition #{{ idx + 1 }}</span>
+                <button v-if="form.conditions.length > 1" class="btn btn-danger btn-sm" @click="removeCondition(idx)">Remove</button>
+              </div>
+              <div class="form-grid">
+                <div class="form-group">
+                  <label>Metric</label>
+                  <input v-model="cond.metric" placeholder="e.g., cpu" />
+                </div>
+                <div class="form-group">
+                  <label>Aggregation</label>
+                  <select v-model="cond.aggregation">
+                    <option value="avg">avg</option>
+                    <option value="max">max</option>
+                    <option value="min">min</option>
+                    <option value="sum">sum</option>
+                    <option value="count">count</option>
+                  </select>
+                </div>
+                <div class="form-group">
+                  <label>Window (seconds)</label>
+                  <input v-model.number="cond.window_secs" type="number" min="15" />
+                </div>
+                <div class="form-group">
+                  <label>Operator</label>
+                  <select v-model="cond.operator">
+                    <option value=">">&gt; Greater Than</option>
+                    <option value=">=">&ge; Greater or Equal</option>
+                    <option value="<">&lt; Less Than</option>
+                    <option value="<=">&le; Less or Equal</option>
+                    <option value="==">== Equal</option>
+                    <option value="!=">!= Not Equal</option>
+                  </select>
+                </div>
+                <div class="form-group">
+                  <label>Threshold</label>
+                  <input v-model.number="cond.threshold" type="number" step="0.1" />
+                </div>
+                <div class="form-group">
+                  <label>Tags Filter (key=value, comma separated)</label>
+                  <input v-model="cond.tagsStr" placeholder="e.g., host=server01" />
+                </div>
+              </div>
             </div>
           </div>
         </div>
@@ -141,25 +185,33 @@
 import { ref, onMounted } from 'vue'
 import {
   getAlertRules, createAlertRule, updateAlertRule,
-  deleteAlertRule, enableAlertRule, disableAlertRule
+  deleteAlertRule, enableAlertRule, disableAlertRule,
+  getAlertTemplates
 } from '../api'
 
 const rules = ref([])
+const templates = ref([])
 const showCreateModal = ref(false)
 const showEditModal = ref(false)
 const editingId = ref(null)
+const selectedTemplate = ref('')
 
-const defaultForm = () => ({
-  name: '',
+const defaultCondition = () => ({
   metric: '',
   aggregation: 'avg',
   window_secs: 300,
   operator: '>',
   threshold: 0,
+  tagsStr: '',
+})
+
+const defaultForm = () => ({
+  name: '',
+  conditions: [defaultCondition()],
+  logic: 'and',
   trigger_count: 1,
   severity: 'warning',
   silence_secs: 300,
-  tagsStr: '',
 })
 
 const form = ref(defaultForm())
@@ -178,6 +230,7 @@ function severityClass(sev) {
 
 function stateClass(state) {
   if (state === 'firing') return 'badge-danger'
+  if (state === 'acknowledged') return 'badge-warning'
   if (state === 'pending') return 'badge-warning'
   if (state === 'resolved') return 'badge-success'
   return 'badge-info'
@@ -197,19 +250,72 @@ function tagsToString(tags) {
   return Object.entries(tags || {}).map(([k, v]) => `${k}=${v}`).join(', ')
 }
 
+function addCondition() {
+  if (form.value.conditions.length < 5) {
+    form.value.conditions.push(defaultCondition())
+  }
+}
+
+function removeCondition(idx) {
+  form.value.conditions.splice(idx, 1)
+}
+
+function openCreateModal() {
+  selectedTemplate.value = ''
+  form.value = defaultForm()
+  showCreateModal.value = true
+}
+
+function applyTemplate() {
+  if (!selectedTemplate.value) return
+  const tmpl = templates.value.find(t => t.id === selectedTemplate.value)
+  if (!tmpl) return
+
+  form.value.name = tmpl.name
+  form.value.severity = tmpl.severity
+  form.value.trigger_count = tmpl.trigger_count
+  form.value.silence_secs = tmpl.silence_secs
+  form.value.logic = tmpl.logic
+  form.value.conditions = tmpl.conditions.map(c => ({
+    metric: c.metric,
+    aggregation: c.aggregation,
+    window_secs: c.window_secs,
+    operator: c.operator,
+    threshold: c.threshold,
+    tagsStr: '',
+  }))
+}
+
 function editRule(r) {
   editingId.value = r.id
+  let conditions = []
+  if (r.conditions && r.conditions.length > 0) {
+    conditions = r.conditions.map(c => ({
+      metric: c.metric,
+      aggregation: c.aggregation,
+      window_secs: c.window_secs,
+      operator: c.operator,
+      threshold: c.threshold,
+      tagsStr: tagsToString(c.tags),
+    }))
+  } else {
+    conditions = [{
+      metric: r.metric,
+      aggregation: r.aggregation,
+      window_secs: r.window_secs,
+      operator: r.operator,
+      threshold: r.threshold,
+      tagsStr: tagsToString(r.tags),
+    }]
+  }
+
   form.value = {
     name: r.name,
-    metric: r.metric,
-    aggregation: r.aggregation,
-    window_secs: r.window_secs,
-    operator: r.operator,
-    threshold: r.threshold,
+    conditions,
+    logic: r.logic || 'and',
     trigger_count: r.trigger_count,
     severity: r.severity,
     silence_secs: r.silence_secs,
-    tagsStr: tagsToString(r.tags),
   }
   showEditModal.value = true
 }
@@ -218,21 +324,33 @@ function closeModal() {
   showCreateModal.value = false
   showEditModal.value = false
   editingId.value = null
+  selectedTemplate.value = ''
   form.value = defaultForm()
 }
 
 async function saveRule() {
+  const primaryCond = form.value.conditions[0] || defaultCondition()
+
   const payload = {
     name: form.value.name,
-    metric: form.value.metric,
-    aggregation: form.value.aggregation,
-    window_secs: form.value.window_secs,
-    operator: form.value.operator,
-    threshold: form.value.threshold,
+    conditions: form.value.conditions.map(c => ({
+      metric: c.metric,
+      aggregation: c.aggregation,
+      window_secs: c.window_secs,
+      operator: c.operator,
+      threshold: c.threshold,
+      tags: parseTags(c.tagsStr),
+    })),
+    logic: form.value.logic,
+    metric: primaryCond.metric,
+    tags: parseTags(primaryCond.tagsStr),
+    aggregation: primaryCond.aggregation,
+    window_secs: primaryCond.window_secs,
+    operator: primaryCond.operator,
+    threshold: primaryCond.threshold,
     trigger_count: form.value.trigger_count,
     severity: form.value.severity,
     silence_secs: form.value.silence_secs,
-    tags: parseTags(form.value.tagsStr),
     enabled: true,
   }
 
@@ -280,7 +398,18 @@ async function loadRules() {
   }
 }
 
-onMounted(loadRules)
+async function loadTemplates() {
+  try {
+    templates.value = await getAlertTemplates()
+  } catch (e) {
+    console.error('Failed to load templates:', e)
+  }
+}
+
+onMounted(() => {
+  loadRules()
+  loadTemplates()
+})
 </script>
 
 <style scoped>
@@ -304,6 +433,10 @@ onMounted(loadRules)
   width: 640px;
   max-height: 90vh;
   overflow-y: auto;
+}
+
+.modal-wide {
+  width: 780px;
 }
 
 .modal-header {
@@ -356,6 +489,26 @@ onMounted(loadRules)
   margin-bottom: 0;
 }
 
+.condition-card {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px 16px;
+  margin-bottom: 8px;
+}
+
+.condition-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
 .toggle-switch {
   position: relative;
   display: inline-block;
@@ -401,4 +554,25 @@ onMounted(loadRules)
   transform: translateX(16px);
   background-color: white;
 }
+
+.logic-tag {
+  display: inline-block;
+  background: rgba(99, 102, 241, 0.15);
+  color: #6366f1;
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: 4px;
+  margin-right: 4px;
+  text-transform: uppercase;
+}
+
+.value-cell {
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.value-alert { color: var(--danger); }
+.value-ok { color: var(--success); }
 </style>

@@ -1,12 +1,78 @@
 use std::collections::BTreeMap;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::path::PathBuf;
 
 use crate::engine::TsdbEngine;
 use crate::engine::query::aggregation::{AggFunc, aggregate};
-use crate::alert::rule::{AlertRule, RuleState, RuleEvalState, AggType};
+use crate::alert::rule::{AlertRule, RuleState, RuleEvalState, AggType, SubCondition};
 use crate::alert::event::{AlertEvent, EventStore};
 use crate::alert::notifier::AlertNotifier;
+
+const AGG_CACHE_MAX_ENTRIES: usize = 500;
+const AGG_CACHE_TTL_SECS: u64 = 15;
+
+struct CacheEntry {
+    value: f64,
+    computed_at: i64,
+}
+
+struct AggCache {
+    entries: BTreeMap<String, CacheEntry>,
+    order: VecDeque<String>,
+}
+
+impl AggCache {
+    fn new() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn make_key(metric: &str, tags: &BTreeMap<String, String>, window_secs: u64) -> String {
+        let mut parts = vec![metric.to_string()];
+        let mut sorted_tags: Vec<_> = tags.iter().collect();
+        sorted_tags.sort_by_key(|(k, _)| *k);
+        for (k, v) in sorted_tags {
+            parts.push(format!("{}={}", k, v));
+        }
+        parts.push(format!("w{}", window_secs));
+        parts.join("|")
+    }
+
+    fn get(&self, key: &str, now_nanos: i64) -> Option<f64> {
+        let entry = self.entries.get(key)?;
+        let elapsed_nanos = now_nanos - entry.computed_at;
+        let ttl_nanos = AGG_CACHE_TTL_SECS as i64 * 1_000_000_000;
+        if elapsed_nanos < ttl_nanos {
+            Some(entry.value)
+        } else {
+            None
+        }
+    }
+
+    fn put(&mut self, key: String, value: f64, now_nanos: i64) {
+        if self.entries.contains_key(&key) {
+            if let Some(entry) = self.entries.get_mut(&key) {
+                entry.value = value;
+                entry.computed_at = now_nanos;
+            }
+            if let Some(pos) = self.order.iter().position(|k| k == &key) {
+                self.order.remove(pos);
+            }
+            self.order.push_back(key);
+        } else {
+            if self.entries.len() >= AGG_CACHE_MAX_ENTRIES {
+                if let Some(evict_key) = self.order.pop_front() {
+                    self.entries.remove(&evict_key);
+                }
+            }
+            self.entries.insert(key.clone(), CacheEntry { value, computed_at: now_nanos });
+            self.order.push_back(key);
+        }
+    }
+}
 
 pub struct AlertEngine {
     engine: Arc<TsdbEngine>,
@@ -14,6 +80,7 @@ pub struct AlertEngine {
     event_store: Arc<EventStore>,
     notifier: Arc<AlertNotifier>,
     eval_states: parking_lot::RwLock<BTreeMap<String, RuleEvalState>>,
+    agg_cache: parking_lot::RwLock<AggCache>,
 }
 
 impl AlertEngine {
@@ -36,6 +103,7 @@ impl AlertEngine {
             event_store,
             notifier,
             eval_states: parking_lot::RwLock::new(eval_states),
+            agg_cache: parking_lot::RwLock::new(AggCache::new()),
         }
     }
 
@@ -86,20 +154,38 @@ impl AlertEngine {
     }
 
     fn evaluate_rule(&self, rule: &AlertRule, now_nanos: i64) {
-        let agg_value = self.query_aggregate(rule, now_nanos);
+        let conditions = rule.effective_conditions();
 
-        let agg_value = match agg_value {
-            Some(v) => v,
-            None => return,
-        };
+        let mut condition_results = Vec::with_capacity(conditions.len());
+        let mut primary_value: Option<f64> = None;
 
-        let condition_met = rule.operator.compare(agg_value, rule.threshold);
+        for cond in &conditions {
+            let agg_value = self.query_subcondition_aggregate(cond, now_nanos);
+            let agg_value = match agg_value {
+                Some(v) => v,
+                None => {
+                    condition_results.push(false);
+                    continue;
+                }
+            };
+
+            if primary_value.is_none() {
+                primary_value = Some(agg_value);
+            }
+
+            let met = cond.operator.compare(agg_value, cond.threshold);
+            condition_results.push(met);
+        }
+
+        let condition_met = rule.evaluate_logic(&condition_results);
 
         let mut states = self.eval_states.write();
         let state = states.entry(rule.id.clone()).or_insert_with(|| RuleEvalState::new(rule.id.clone()));
 
         state.last_eval_time = Some(now_nanos);
-        state.current_value = Some(agg_value);
+        if let Some(v) = primary_value {
+            state.current_value = Some(v);
+        }
 
         let prev_state = state.state;
 
@@ -107,7 +193,7 @@ impl AlertEngine {
             state.consecutive_count += 1;
 
             if state.consecutive_count >= rule.trigger_count {
-                if prev_state != RuleState::Firing {
+                if prev_state != RuleState::Firing && prev_state != RuleState::Acknowledged {
                     let in_silence = if let Some(last_fire) = state.last_fire_time {
                         let silence_nanos = rule.silence_secs as i64 * 1_000_000_000;
                         now_nanos < last_fire + silence_nanos
@@ -126,11 +212,13 @@ impl AlertEngine {
                             rule_name: rule.name.clone(),
                             event_type: "firing".to_string(),
                             timestamp: now_nanos,
-                            value: agg_value,
+                            value: primary_value.unwrap_or(0.0),
                             threshold: rule.threshold,
                             severity: rule.severity.as_str().to_string(),
                             metric: rule.metric.clone(),
                             tags: rule.tags.clone(),
+                            acknowledged: false,
+                            acknowledged_by: None,
                         };
 
                         self.event_store.append(&event);
@@ -140,12 +228,12 @@ impl AlertEngine {
                     }
                 }
             } else {
-                if prev_state != RuleState::Pending && prev_state != RuleState::Firing {
+                if prev_state != RuleState::Pending && prev_state != RuleState::Firing && prev_state != RuleState::Acknowledged {
                     state.state = RuleState::Pending;
                 }
             }
         } else {
-            if prev_state == RuleState::Firing || prev_state == RuleState::Pending {
+            if prev_state == RuleState::Firing || prev_state == RuleState::Acknowledged || prev_state == RuleState::Pending {
                 state.state = RuleState::Resolved;
                 state.consecutive_count = 0;
                 drop(states);
@@ -156,11 +244,13 @@ impl AlertEngine {
                     rule_name: rule.name.clone(),
                     event_type: "resolved".to_string(),
                     timestamp: now_nanos,
-                    value: agg_value,
+                    value: primary_value.unwrap_or(0.0),
                     threshold: rule.threshold,
                     severity: rule.severity.as_str().to_string(),
                     metric: rule.metric.clone(),
                     tags: rule.tags.clone(),
+                    acknowledged: false,
+                    acknowledged_by: None,
                 };
 
                 self.event_store.append(&event);
@@ -172,20 +262,46 @@ impl AlertEngine {
         }
     }
 
-    fn query_aggregate(&self, rule: &AlertRule, now_nanos: i64) -> Option<f64> {
-        let window_nanos = rule.window_secs as i64 * 1_000_000_000;
+    fn query_subcondition_aggregate(&self, cond: &SubCondition, now_nanos: i64) -> Option<f64> {
+        let cache_key = AggCache::make_key(&cond.metric, &cond.tags, cond.window_secs);
+        {
+            let cache = self.agg_cache.read();
+            if let Some(cached) = cache.get(&cache_key, now_nanos) {
+                return Some(cached);
+            }
+        }
+
+        let result = self.query_aggregate_raw(&cond.metric, &cond.tags, cond.aggregation, cond.window_secs, now_nanos);
+
+        if let Some(v) = result {
+            let mut cache = self.agg_cache.write();
+            cache.put(cache_key, v, now_nanos);
+        }
+
+        result
+    }
+
+    fn query_aggregate_raw(
+        &self,
+        metric: &str,
+        tags: &BTreeMap<String, String>,
+        aggregation: AggType,
+        window_secs: u64,
+        now_nanos: i64,
+    ) -> Option<f64> {
+        let window_nanos = window_secs as i64 * 1_000_000_000;
         let start_time = now_nanos - window_nanos;
         let end_time = now_nanos;
 
-        let series_ids = if rule.tags.is_empty() {
-            self.engine.inverted_index.lookup_metric(&rule.metric)
+        let series_ids = if tags.is_empty() {
+            self.engine.inverted_index.lookup_metric(metric)
         } else {
-            let indexed_tags: BTreeMap<String, String> = rule.tags.iter()
+            let indexed_tags: BTreeMap<String, String> = tags.iter()
                 .filter(|(k, _)| self.engine.inverted_index.is_indexable(k))
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
             if indexed_tags.is_empty() {
-                self.engine.inverted_index.lookup_metric(&rule.metric)
+                self.engine.inverted_index.lookup_metric(metric)
             } else {
                 self.engine.inverted_index.lookup_multi(&indexed_tags)
             }
@@ -195,7 +311,7 @@ impl AlertEngine {
             return None;
         }
 
-        let agg_func = match rule.aggregation {
+        let agg_func = match aggregation {
             AggType::Avg => AggFunc::Avg,
             AggType::Max => AggFunc::Max,
             AggType::Min => AggFunc::Min,
@@ -216,7 +332,7 @@ impl AlertEngine {
                 }
             }
 
-            let blocks = self.engine.time_index.find_blocks(&rule.metric, start_time, end_time);
+            let blocks = self.engine.time_index.find_blocks(metric, start_time, end_time);
             for meta in &blocks {
                 if let Ok(decoded) = self.engine.block_store.read_block(meta) {
                     for series_data in &decoded.series {
@@ -271,6 +387,19 @@ impl AlertEngine {
         }
 
         Some(aggregate(&all_values, &agg_func))
+    }
+
+    pub fn acknowledge_event(&self, event_id: &str, operator: &str) -> Option<AlertEvent> {
+        let event = self.event_store.acknowledge_event(event_id, operator)?;
+
+        let mut states = self.eval_states.write();
+        if let Some(state) = states.get_mut(&event.rule_id) {
+            if state.state == RuleState::Firing {
+                state.state = RuleState::Acknowledged;
+            }
+        }
+
+        Some(event)
     }
 
     pub fn start_background_eval(self: Arc<Self>) {

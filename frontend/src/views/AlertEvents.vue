@@ -45,7 +45,7 @@
 
     <div class="card">
       <div class="card-header">
-        <h3>Events ({{ total }})</h3>
+        <h3>Events</h3>
       </div>
       <div v-if="events.length === 0" style="color: var(--text-muted); font-size: 13px; padding: 8px 0;">No alert events found</div>
       <div v-else class="timeline">
@@ -59,7 +59,7 @@
           <div class="timeline-content">
             <div class="timeline-header">
               <span class="badge" :class="severityClass(event.severity)">{{ event.severity }}</span>
-              <span class="badge" :class="typeClass(event.event_type)">{{ event.event_type }}</span>
+              <span class="badge" :class="typeClass(event)">{{ effectiveType(event) }}</span>
               <span class="timeline-rule">{{ event.rule_name }}</span>
               <span class="timeline-time">{{ formatTime(event.timestamp) }}</span>
             </div>
@@ -79,12 +79,18 @@
               <div v-if="event.tags && Object.keys(event.tags).length > 0" class="timeline-tags">
                 <span v-for="(v, k) in event.tags" :key="k" class="tag-chip">{{ k }}={{ v }}</span>
               </div>
+              <div v-if="event.acknowledged" class="ack-info">
+                <span class="ack-badge">Acknowledged by {{ event.acknowledged_by || 'unknown' }}</span>
+              </div>
+              <div v-if="canAck(event)" class="ack-action">
+                <button class="btn btn-secondary btn-sm ack-btn" @click="ackEvent(event)">Acknowledge</button>
+              </div>
             </div>
           </div>
         </div>
       </div>
-      <div v-if="events.length < total" class="pagination">
-        <button class="btn btn-secondary" @click="loadMore">Load More ({{ total - events.length }} remaining)</button>
+      <div v-if="nextCursor != null" class="pagination">
+        <button class="btn btn-secondary" @click="loadMore">Load More</button>
       </div>
     </div>
   </div>
@@ -92,10 +98,10 @@
 
 <script setup>
 import { ref, onMounted, onUnmounted } from 'vue'
-import { getAlertEvents, createAlertWs } from '../api'
+import { getAlertEvents, createAlertWs, acknowledgeAlertEvent } from '../api'
 
 const events = ref([])
-const total = ref(0)
+const nextCursor = ref(null)
 const wsConnected = ref(false)
 let ws = null
 let wsReconnectTimer = null
@@ -107,7 +113,6 @@ const filters = ref({
   endTime: '',
 })
 
-const currentOffset = ref(0)
 const pageSize = 50
 
 function formatTime(tsNanos) {
@@ -127,14 +132,25 @@ function typeClass(type) {
   return 'badge-info'
 }
 
+function effectiveType(event) {
+  if (event.acknowledged && event.event_type === 'firing') return 'acknowledged'
+  return event.event_type
+}
+
 function dotClass(event) {
+  if (event.acknowledged && event.event_type === 'firing') return 'dot-ack'
   if (event.event_type === 'firing') return 'dot-firing'
   if (event.event_type === 'resolved') return 'dot-resolved'
   return 'dot-default'
 }
 
-function buildParams(offset = 0) {
-  const params = { offset, limit: pageSize }
+function canAck(event) {
+  return event.event_type === 'firing' && !event.acknowledged
+}
+
+function buildParams(cursor = null) {
+  const params = { limit: pageSize }
+  if (cursor !== null) params.cursor = cursor
   if (filters.value.severity) params.severity = filters.value.severity
   if (filters.value.rule_name) params.rule_name = filters.value.rule_name
   if (filters.value.startTime) {
@@ -148,11 +164,10 @@ function buildParams(offset = 0) {
 
 async function loadEvents() {
   try {
-    const params = buildParams(0)
+    const params = buildParams()
     const data = await getAlertEvents(params)
     events.value = data.events || []
-    total.value = data.total || 0
-    currentOffset.value = events.value.length
+    nextCursor.value = data.next_cursor || null
   } catch (e) {
     console.error('Failed to load events:', e)
   }
@@ -160,13 +175,24 @@ async function loadEvents() {
 
 async function loadMore() {
   try {
-    const params = buildParams(currentOffset.value)
+    const params = buildParams(nextCursor.value)
     const data = await getAlertEvents(params)
     events.value = [...events.value, ...(data.events || [])]
-    total.value = data.total || 0
-    currentOffset.value = events.value.length
+    nextCursor.value = data.next_cursor || null
   } catch (e) {
     console.error('Failed to load more events:', e)
+  }
+}
+
+async function ackEvent(event) {
+  const operator = prompt('Enter your name to acknowledge this alert:')
+  if (!operator) return
+  try {
+    await acknowledgeAlertEvent(event.id, { operator })
+    event.acknowledged = true
+    event.acknowledged_by = operator
+  } catch (e) {
+    console.error('Failed to acknowledge event:', e)
   }
 }
 
@@ -180,11 +206,9 @@ function handleWsMessage(event) {
     const alertEvent = JSON.parse(event.data)
     alertEvent._isNew = true
     events.value.unshift(alertEvent)
-    total.value += 1
 
     if (filters.value.severity && alertEvent.severity !== filters.value.severity) {
       events.value.shift()
-      total.value -= 1
     }
 
     setTimeout(() => {
@@ -305,6 +329,7 @@ onUnmounted(() => {
 }
 
 .dot-firing { background: var(--danger); }
+.dot-ack { background: #f59e0b; }
 .dot-resolved { background: var(--success); }
 .dot-default { background: var(--text-muted); }
 
@@ -363,6 +388,34 @@ onUnmounted(() => {
 .timeline-tags .tag-chip {
   font-size: 11px;
   padding: 2px 8px;
+}
+
+.ack-info {
+  margin-top: 6px;
+}
+
+.ack-badge {
+  display: inline-block;
+  background: rgba(245, 158, 11, 0.15);
+  color: #f59e0b;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 4px;
+}
+
+.ack-action {
+  margin-top: 8px;
+}
+
+.ack-btn {
+  font-size: 11px;
+  border-color: #f59e0b;
+  color: #f59e0b;
+}
+
+.ack-btn:hover {
+  background: rgba(245, 158, 11, 0.1);
 }
 
 .pagination {

@@ -117,6 +117,16 @@ export async function getActiveAlerts() {
   return resp.data
 }
 
+export async function acknowledgeAlertEvent(id, body) {
+  const resp = await api.post(`/alerts/events/${id}/ack`, body)
+  return resp.data
+}
+
+export async function getAlertTemplates() {
+  const resp = await api.get('/alerts/templates')
+  return resp.data
+}
+
 export function createAlertWs() {
   const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
   const url = `${proto}//${window.location.host}/ws/alerts`
